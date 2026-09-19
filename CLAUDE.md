@@ -65,8 +65,10 @@ edges can only be seen, never heard. Observation types and their data:
 | Tree      | type, distance, angle                                       |
 | Edge      | type, coordinates (start, end)                              |
 
-My action per agent: agent_id, move_distance (float), move_direction (absolute,
-radians), turn_angle (radians), spawn_agent (boolean).
+My action per agent: agent_id, move_distance (float), move_direction (relative to
+the agent's current facing direction, radians), turn_angle (radians), spawn_agent
+(boolean). The README calls move_direction absolute, but the code adds it to the
+agent's current direction, so it is actually relative.
 
 ### Energy costs
 
@@ -132,7 +134,7 @@ often fails on a university network.
 Validation attempts are unlimited and use random seeds. Evaluation is 1 attempt
 only, runs 3 simulations in a row, and the score is the average, so the server
 has to stay up through all 3. The server waits at most 10 seconds for a response,
-and if accumulated wait reaches 600 seconds the run ends. The simulation is
+and if accumulated wait reaches 1200 seconds the run ends. The simulation is
 deterministic only on the same operating system, so a seed only reproduces on
 Linux.
 
