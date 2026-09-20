@@ -109,11 +109,11 @@ seconds out of 3000. That is the floor.
 
 ## Setup
 
-Python 3.10 or newer.
+Python 3.10 or newer. Use the existing `nordicai` conda environment, do not
+create a venv or any other environment.
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+conda activate nordicai
 pip install -r requirements.txt
 python local_playground.py
 ```
@@ -142,3 +142,96 @@ Linux.
 
 Keep a running log of what we tried and what it scored, so I can see the
 progression rather than just the final answer. Add it below this line.
+
+- Dummy baseline: 21.16, all agents dead at 21s.
+- Ring formation policy v1 (clustering, fruit-seeking, wall avoidance,
+  spawn once energy > 100), not yet committed: 31.42 on one local run
+  (seed 2300228456). Observed bug: agents visibly got stuck in corners
+  and stopped moving, and often ended up facing a wall or straight out
+  of the map when close to the boundary.
+- Ring formation policy v2: fixed 3 wall-avoidance gaps.
+  1. A lone/searching agent (no clustermates, no fruit, nobody to join)
+     was walking straight ahead every tick with no wall check at all.
+  2. Merging into a cluster called the movement function without passing
+     it the wall data, so wall avoidance silently got skipped right at
+     that moment.
+  3. The facing-correction only checked the first nearby wall in view,
+     so in a corner (two walls close together) fixing away from one
+     could still leave the agent staring at the other, or through the
+     gap past the corner. Now checks all nearby walls and retries up to
+     a full turn.
+  Scores on 4 local runs: 42.62, 41.85, 30.93, 22.06 (different random
+  seeds each run). Better on most seeds than v1, but still a lot of
+  variance and one run barely beat baseline, so walls were not the only
+  cause of early deaths.
+- Watched v2 run live (verbose=True, seed 3672530907): scored 202.35, last
+  agent dead at 196.6s. Confirms the wall fixes work, not just on paper.
+- Still saw agents standing still for a long time in that run, sometimes
+  near a tree. Traced it with a temporary debug print: not trees (they
+  don't block movement in this game), and not the map's random obstacle
+  either. It was `_avoid_walls`, the function that redirects a move away
+  from a nearby wall/obstacle: it used a crude "blocked" test (any
+  direction with even a loose component toward the wall counts as
+  blocked, a full half-circle per wall), while the facing-avoidance
+  function next to it already used a narrower, correct test. Near a
+  corner the crude test could rule out all 4 directions it tried and the
+  agent would stand there permanently, since obstacles never move.
+  Debug run before the fix: 157 near-zero-move ticks, 118 of them one
+  agent stuck back to back for 11.8s straight.
+- Ring formation policy v3: rewrote `_avoid_walls` to use the same
+  narrow-cone test as the facing function, via one shared helper
+  (`_find_clear_angle`) both now call, so they can't drift apart again.
+  Re-ran the same debug check after: 0 genuinely-boxed-in cases across 3
+  runs, so the corner-stuck bug looks fixed for real (the earlier count
+  was conflating it with agents intentionally holding a ring position
+  near a wall, which isn't a bug). Scores on 3 runs: 46.34, 28.42, 230.87.
+- Watched v3 live: still saw an agent get stuck, this time squeezed
+  between the map's random obstacle and the boundary wall. v3's
+  angle-cone test doesn't shrink or grow with how close a wall actually
+  is, so it can still misjudge a narrow gap.
+- Ring formation policy v4: replaced the movement check with a real
+  geometric one. `_avoid_walls` now samples points along the actual
+  straight-line path a move would take and checks their distance to the
+  true wall/obstacle edges (not just a fixed angle cone), redirecting to
+  the nearest angle whose path stays clear. (Facing still uses the old
+  angle-cone test, since it's just a gaze heuristic, not a real move.)
+  First pass used a 10-unit safety clearance and still found agents
+  genuinely stuck 10-30s straight in every one of 5 test runs, this
+  time for real (confirmed with a debug counter, not a false positive).
+  Turned out the clearance was more conservative than the game itself:
+  agent radius is only 5, so 10 was ruling out gaps the game would
+  actually let an agent through. Dropped it to 6: 0 genuinely-stuck
+  cases across 10 runs. Scores on those 10 runs: 147.9, 169.5, 33.9,
+  32.0, 88.8, 67.9, 154.7, 26.9, 102.3, 150.2 (average ~97). Debug code
+  removed after confirming.
+- Watched v4 live: still got stuck, this time between the map's random
+  obstacle and the boundary wall. Turns out there isn't one random
+  obstacle, there are 80 (`env_width // 20` in src/utils/simulation.py,
+  a detail I got wrong earlier). Wrote a standalone ground-truth tracer
+  (reads real agent x,y from sim.env directly, not through the policy's
+  limited observations) to confirm: one agent was genuinely wedged
+  among 3 clustered obstacles, net movement of 1-4 units over rolling
+  3-second windows, for 38 real seconds straight (t=71 to t=109 in one
+  run), not a false alarm.
+- Ring formation policy v5: two additions to `_avoid_walls`.
+  1. Per-agent "which way am I deflecting" memory (`_avoid_bias`). Once
+     an agent starts going around an obstacle turning e.g. left, it
+     keeps preferring left instead of the one-step sweep re-deciding
+     fresh each tick, which was causing left-right-left zigzagging in
+     place near tight obstacle clusters (classic "wall following").
+     Helped (avg score across 5 runs ~97 -> better spread) but didn't
+     fully solve genuine 3-obstacle pockets, since it's still only a
+     one-step lookahead.
+  2. Stall-escape fallback (`_stall_ticks`, `_retreat_from`): if an
+     agent has spent 20+ ticks (2s) in a row actively deflecting with
+     no real escape, stop maneuvering cleverly and just retreat
+     straight away from the combined center of every nearby wall/
+     obstacle edge. Close to guaranteed to clear a tight pocket, even
+     if not the shortest way out. Re-ran the tracer on the exact seed
+     with the 38s freeze: no more sustained streaks anywhere, just
+     brief 2-4s episodes scattered as the agent actually travels and
+     occasionally gets briefly caught elsewhere. Scores on 8 fresh
+     runs: 95.9, 223.8, 210.3, 145.1, 27.8, 61.5, 195.7, 194.8
+     (average ~144, up from ~97).
+- Watched v5 live (seed 3346480106): scored 105.72, last agent dead at
+  107.3s. Confirmed by eye: no freezing this time.
