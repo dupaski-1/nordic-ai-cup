@@ -23,12 +23,17 @@ MAX_CLUSTER_SIZE = 6      # exact 360 coverage at the default 60 degree cone
 SPAWN_ENERGY = 100.0      # matches the game's own spawn threshold (environment.py)
 SWEEP_STEP = 0.05         # radians per tick added to the coverage-sweep phase
 SCOUT_JITTER = 0.5        # radians of randomness in the scout's heading each tick
-WALL_AVOID_DISTANCE = 40.0  # skip a move heading into a wall closer than this
+WALL_AVOID_DISTANCE = 40.0  # only worry about walls/obstacles closer than this
+WALL_BLOCK_CONE = np.pi / 6  # how narrow a direction has to be to count as "aimed at" a wall, for facing only
+WALL_CLEARANCE = 6.0         # how much space a move must keep from any wall/obstacle edge (agent size is 5)
+STALL_ESCAPE_TICKS = 20      # after this many ticks fighting the same obstacles, stop maneuvering and retreat
 
 _cluster_of = {}          # agent_id -> cluster_id
 _cluster_members = {}     # cluster_id -> set of agent_id
 _last_known_energy = {}   # agent_id -> energy, as of the last time we processed it
 _sweep_phase = {}         # agent_id -> current phase of its coverage sweep
+_avoid_bias = {}          # agent_id -> +1/-1, which turn direction it's currently deflecting with
+_stall_ticks = {}         # agent_id -> consecutive ticks spent actively deflecting around a wall/obstacle
 
 
 def _ensure_registered(agent_id):
@@ -91,7 +96,7 @@ def action_decision(observation_response: dict, rng: random.Random) -> ActionReq
         # Any agent heads for a fruit it spots, clustered or not, this
         # does not depend on currently seeing a clustermate too.
         target = min(fruits, key=lambda o: o["distance"])
-        move_distance, move_direction = _move_toward(target, speed, observations)
+        move_distance, move_direction = _move_toward(target, speed, observations, agent_id)
         if clustermates:
             turn_angle = _facing(clustermates, agent_id, my_cluster_id, vision_angle, observations)
         else:
@@ -118,14 +123,18 @@ def action_decision(observation_response: dict, rng: random.Random) -> ActionReq
             closest = min(joinable, key=lambda o: o["distance"])
             if closest["distance"] <= JOIN_RANGE:
                 _merge_into(agent_id, _cluster_of[closest["id"]])
-                move_distance, move_direction, turn_angle = _settle([closest], speed)
+                move_distance, move_direction, turn_angle = _settle(
+                    [closest], speed, agent_id=agent_id, cluster_id=_cluster_of[agent_id],
+                    observations=observations, vision_angle=vision_angle, rng=rng,
+                )
             else:
-                move_distance, move_direction = _move_toward(closest, speed, observations)
+                move_distance, move_direction = _move_toward(closest, speed, observations, agent_id)
                 turn_angle = closest["angle"]
         else:
-            move_distance = speed
-            move_direction = 0.0
-            turn_angle = rng.uniform(-SEARCH_TURN, SEARCH_TURN)
+            move_x, move_y = _avoid_walls(speed, 0.0, observations, agent_id)
+            move_distance = min(speed, np.hypot(move_x, move_y))
+            move_direction = np.arctan2(move_y, move_x) if move_distance > 0.1 else 0.0
+            turn_angle = _avoid_wall_facing(rng.uniform(-SEARCH_TURN, SEARCH_TURN), observations)
 
     current_cluster_size = len(_cluster_members[_cluster_of[agent_id]])
     spawn_agent = energy > SPAWN_ENERGY and current_cluster_size < MAX_CLUSTER_SIZE
@@ -175,7 +184,7 @@ def _settle(ring_sightings, speed, agent_id=None, cluster_id=None, observations=
             scout_angle = rng.uniform(-SCOUT_JITTER, SCOUT_JITTER) if rng else 0.0
             move_x = speed * np.cos(scout_angle)
             move_y = speed * np.sin(scout_angle)
-        move_x, move_y = _avoid_walls(move_x, move_y, observations)
+        move_x, move_y = _avoid_walls(move_x, move_y, observations, agent_id)
 
     sweep_offset = _sweep_offset(agent_id, cluster_id, vision_angle)
     move_distance = min(speed, np.hypot(move_x, move_y))
@@ -222,12 +231,12 @@ def _sweep_offset(agent_id, cluster_id, vision_angle):
     return (gap / 2.0) * np.sin(phase)
 
 
-def _move_toward(target, speed, observations):
+def _move_toward(target, speed, observations, agent_id=None):
     """Move toward a relative-angle sighting (a fruit or another agent),
     skipping the move instead of paying for one that a nearby wall blocks."""
     move_x = target["distance"] * np.cos(target["angle"])
     move_y = target["distance"] * np.sin(target["angle"])
-    move_x, move_y = _avoid_walls(move_x, move_y, observations)
+    move_x, move_y = _avoid_walls(move_x, move_y, observations, agent_id)
     move_distance = min(speed, np.hypot(move_x, move_y))
     move_direction = np.arctan2(move_y, move_x) if move_distance > 0.1 else 0.0
     return float(move_distance), float(move_direction)
@@ -241,58 +250,160 @@ def _edge_midpoints(observations):
     ]
 
 
-def _avoid_walls(move_x, move_y, observations):
+def _point_segment_distance(px, py, ax, ay, bx, by):
+    """Distance from point (px, py) to the closest point on segment (ax, ay)-(bx, by)."""
+    abx, aby = bx - ax, by - ay
+    ab_len_sq = abx * abx + aby * aby
+    if ab_len_sq < 1e-9:  # the "segment" is really just a point
+        return np.hypot(px - ax, py - ay)
+    t = ((px - ax) * abx + (py - ay) * aby) / ab_len_sq
+    t = max(0.0, min(1.0, t))  # clamp to the segment, not the infinite line
+    cx, cy = ax + t * abx, ay + t * aby
+    return np.hypot(px - cx, py - cy)
+
+
+def _edge_segments(observations):
+    return [(sx, sy, ex, ey) for o in observations if o.get("type") == "Edge" for (sx, sy), (ex, ey) in [o["coords"]]]
+
+
+def _nearby_segments(observations):
+    """Only the wall/obstacle edges close enough to matter right now."""
+    return [seg for seg in _edge_segments(observations) if _point_segment_distance(0.0, 0.0, *seg) < WALL_AVOID_DISTANCE]
+
+
+def _path_clear(move_mag, angle, segments):
     """
-    If the intended move heads into a close wall, try a fixed sequence of
-    alternate directions (quarter turn each way, then a full reversal)
-    before giving up. Always trying the same sequence, rather than
-    computing a wall-specific "away" direction, avoids two failure modes
-    we hit before: bouncing back and forth between two nearby walls in a
-    corner, and simply refusing to move at all when boxed in on one side
-    (an agent boxed in on one side can usually still turn along the wall).
+    Check a handful of points spaced along the straight-line path this
+    move would take (not just where it lands) against every nearby wall
+    or obstacle edge. Checking the whole path, not just the endpoint,
+    catches a move that clips a wall partway through, which matters in
+    a tight spot like a gap between the map boundary and an obstacle.
     """
-    midpoints = _edge_midpoints(observations)
-    if not midpoints:
+    end_x, end_y = move_mag * np.cos(angle), move_mag * np.sin(angle)
+    for t in (0.25, 0.5, 0.75, 1.0):
+        px, py = end_x * t, end_y * t
+        for seg in segments:
+            if _point_segment_distance(px, py, *seg) < WALL_CLEARANCE:
+                return False
+    return True
+
+
+def _find_clear_move(base_angle, move_mag, segments, agent_id=None):
+    """
+    Sweep outward from base_angle in small alternating steps (a bit one
+    way, a bit the other, then further out each time) until finding an
+    angle whose path stays clear of every nearby wall/obstacle, or give
+    up after a full circle (boxed in on all sides, at least one step at
+    a time). Only called once we already know base_angle itself isn't
+    clear.
+
+    Which way "a bit one way" tries first is remembered per agent
+    (_avoid_bias): once an agent starts deflecting left (say) around an
+    obstacle, it keeps preferring left on later ticks instead of the
+    sweep re-deciding fresh each time. Without that memory, a slightly
+    different position each tick can flip which side looks clear first,
+    and the agent zigzags left-right-left in place near a tight cluster
+    of obstacles instead of committing to one way around, the classic
+    "wall following" trick for exactly this.
+    """
+    bias = _avoid_bias.get(agent_id) if agent_id is not None else None
+    signs = (bias, -bias) if bias else (1, -1)
+
+    step = np.pi / 6
+    for i in range(1, int(np.pi / step) + 1):
+        for sign in signs:
+            candidate = _wrap(base_angle + sign * step * i)
+            if _path_clear(move_mag, candidate, segments):
+                if agent_id is not None:
+                    _avoid_bias[agent_id] = sign
+                return candidate
+
+    return None  # every direction we tried still clips a wall
+
+
+def _retreat_from(segments, move_mag):
+    """
+    Move straight away from the combined center of every nearby wall or
+    obstacle edge, ignoring wherever we were actually trying to go.
+    Used only once we've been deflecting around the same obstacles for
+    a while with no real escape (STALL_ESCAPE_TICKS): heading away from
+    all of them at once is close to guaranteed to clear a tight pocket
+    between several obstacles, even if it's not the shortest way out,
+    which a one-step-at-a-time deflection can't reliably find.
+    """
+    cx = sum((sx + ex) / 2.0 for sx, sy, ex, ey in segments) / len(segments)
+    cy = sum((sy + ey) / 2.0 for sx, sy, ex, ey in segments) / len(segments)
+    away_angle = np.arctan2(-cy, -cx)
+    return move_mag * np.cos(away_angle), move_mag * np.sin(away_angle)
+
+
+def _avoid_walls(move_x, move_y, observations, agent_id=None):
+    """
+    If the intended move's path would come too close to a wall or
+    obstacle, redirect it to the nearest clear angle instead (see
+    _find_clear_move), keeping the same move distance. If truly nothing
+    is clear, hold still rather than pay for a move that just gets
+    blocked anyway. If we've had to deflect for too many ticks in a row
+    (STALL_ESCAPE_TICKS), stop trying to be clever and retreat instead
+    (see _retreat_from).
+    """
+    segments = _nearby_segments(observations)
+    if not segments:
+        if agent_id is not None:
+            _stall_ticks[agent_id] = 0
         return move_x, move_y
 
     move_mag = np.hypot(move_x, move_y)
     if move_mag < 0.1:
         return move_x, move_y
 
-    def blocked(mx_, my_):
-        return any(
-            np.hypot(wx, wy) < WALL_AVOID_DISTANCE and (mx_ * wx + my_ * wy) > 0
-            for wx, wy in midpoints
-        )
+    base_angle = np.arctan2(move_y, move_x)
 
-    if not blocked(move_x, move_y):
+    if agent_id is not None and _stall_ticks.get(agent_id, 0) >= STALL_ESCAPE_TICKS:
+        _stall_ticks[agent_id] = 0  # give the retreat a fresh start
+        return _retreat_from(segments, move_mag)
+
+    if _path_clear(move_mag, base_angle, segments):
+        if agent_id is not None:
+            _stall_ticks[agent_id] = 0
+            _avoid_bias[agent_id] = None
         return move_x, move_y
 
-    base_angle = np.arctan2(move_y, move_x)
-    for turn in (np.pi / 2, -np.pi / 2, np.pi):
-        candidate_angle = base_angle + turn
-        cx, cy = move_mag * np.cos(candidate_angle), move_mag * np.sin(candidate_angle)
-        if not blocked(cx, cy):
-            return cx, cy
+    if agent_id is not None:
+        _stall_ticks[agent_id] = _stall_ticks.get(agent_id, 0) + 1
 
-    return 0.0, 0.0  # boxed in on every side we tried, hold still
+    clear_angle = _find_clear_move(base_angle, move_mag, segments, agent_id)
+    if clear_angle is None:
+        return 0.0, 0.0
+    return move_mag * np.cos(clear_angle), move_mag * np.sin(clear_angle)
 
 
 def _avoid_wall_facing(turn_angle, observations):
     """
     If the facing we're about to turn to would stare straight into a close
     wall (as happens at a map corner, where "face away from the cluster"
-    can point past the boundary), rotate an extra quarter turn to look
-    along the wall instead, toward ground something could actually
-    approach through.
+    can point past the boundary), rotate to the nearest angle that isn't
+    aimed straight at a nearby wall, toward ground something could
+    actually approach through. This is just a gaze heuristic (a narrow
+    cone per wall, not real collision geometry), since facing has no
+    physical move to check a path for.
     """
-    for wx, wy in _edge_midpoints(observations):
-        if np.hypot(wx, wy) >= WALL_AVOID_DISTANCE:
-            continue
-        angle_after_turn = _wrap(np.arctan2(wy, wx) - turn_angle)
-        if abs(angle_after_turn) < np.pi / 6:
-            return _wrap(turn_angle + np.pi / 2)
-    return turn_angle
+    nearby = [(wx, wy) for wx, wy in _edge_midpoints(observations) if np.hypot(wx, wy) < WALL_AVOID_DISTANCE]
+
+    def facing_a_wall(angle):
+        return any(abs(_wrap(np.arctan2(wy, wx) - angle)) < WALL_BLOCK_CONE for wx, wy in nearby)
+
+    if not facing_a_wall(turn_angle):
+        return turn_angle
+
+    step = np.pi / 6
+    for i in range(1, int(np.pi / step) + 1):
+        for turn in (step * i, -step * i):
+            candidate = _wrap(turn_angle + turn)
+            if not facing_a_wall(candidate):
+                return candidate
+
+    return turn_angle  # every direction we tried is still aimed at a wall
 
 
 def _wrap(angle):
