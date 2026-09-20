@@ -1,5 +1,6 @@
 # Nordic AI Cup 2026: Survival Simulator
 
+
 ## Who I am and how to work with me
 
 I am Arnaud, a few weeks into a master's in data science for business at BI Oslo.
@@ -41,7 +42,10 @@ do not.
 This is my own copy of the survival-simulator challenge from the Nordic AI Cup
 2026, hosted by Ambolt AI across Sweden, Denmark, Finland, Norway and Iceland.
 
+## Git
+
 Upstream repository: https://github.com/amboltio/Nordic-AI-Cup-2026
+Do not use git worktrees. Work directly in this folder on the current branch.
 
 ### What the challenge is
 
