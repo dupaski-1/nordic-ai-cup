@@ -286,3 +286,6 @@ tick one.
   no sustained stuck streaks anywhere. Scores on 6 fresh runs after the
   fix: 696.2, 645.3, 616.1, 835.6, 729.3, 531.0 (average ~675) — no
   regression from v1's ~707, and the spinning is gone.
+- Watched v2 live (seed 1906357515): scored 1271.72, best result so far by
+  a wide margin, last agent dead at t=1209.1s out of 3000. Confirmed by
+  eye: spinning bug is gone.
