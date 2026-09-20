@@ -235,3 +235,39 @@ progression rather than just the final answer. Add it below this line.
      (average ~144, up from ~97).
 - Watched v5 live (seed 3346480106): scored 105.72, last agent dead at
   107.3s. Confirmed by eye: no freezing this time.
+
+## Strategy B: scatter (branch strategy-b)
+
+Ring formation clusters agents into a ring. Turns out that is actively
+dangerous: a predator kills every agent touching it in the same tick, no
+cooldown, no per-kill limit (environment.py ~line 720), so a tight cluster
+that gets caught can lose several agents at once. Strategy B does the
+opposite: agents spread out instead of clustering, with a real per-tick
+priority order: evade a predator (hard override) > reproduce at 85% of
+max_energy > go to the closest visible fruit > wander. A base layer nudges
+every agent's path away from others it can see, just enough to separate
+paths, not a full reversal.
+
+Reused the wall/obstacle-avoidance code verbatim from the ring-formation
+policy (path-based collision check, deflection memory, stall-escape
+retreat), since it is generic and already proven to stop agents freezing
+near walls.
+
+Evasion detail: while fleeing, the agent turns to face the predator rather
+than away from it. Reading predator.py: a predator only breaks into a
+slower flanking maneuver instead of a direct sprint chase when the agent
+it is chasing is looking towards it and is not too close, so keeping it in
+view while retreating degrades its pursuit path.
+
+Wander does not use `rng` at all, since `agent_server.py` recreates it
+fresh (same seed) on every single request, so a draw from it does not
+actually vary tick to tick when this runs for real. Instead each agent has
+a deterministic phase that advances every tick, plus a per-agent starting
+offset (golden-angle spaced by agent_id) so agents wander differently from
+tick one.
+
+- Strategy B v1: scores on 9 local runs: 544.9, 615.2, 504.8, 904.2, 743.9,
+  532.3, 805.4, 708.7, 903.3 (average ~707). Roughly 5x the ring-formation
+  policy's ~144 average, and ~33x the original 21.16 baseline. Not yet
+  watched live to confirm the intended behavior (scattering, facing down
+  predators, no freezing) matches what is actually happening on screen.
