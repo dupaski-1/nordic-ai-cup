@@ -29,7 +29,7 @@ REPRODUCE_ENERGY_FRACTION = 0.85  # spawn once energy is at least this fraction 
 DIVERGE_RADIUS = 60.0             # start nudging away from another agent within this range
 DIVERGE_STRENGTH = 0.5            # how much that nudge can bend the path (kept well under a full reversal)
 WANDER_STEP = 0.04                # phase advance per tick while wandering
-WANDER_AMPLITUDE = 1.2            # radians of heading swing while wandering
+WANDER_TURN_STEP = 0.15           # max radians turned per tick while wandering (small: see _wander_turn)
 WALL_AVOID_DISTANCE = 40.0        # only worry about walls/obstacles closer than this
 WALL_BLOCK_CONE = np.pi / 6       # how narrow a direction has to be to count as "aimed at" a wall, for facing only
 WALL_CLEARANCE = 6.0              # how much space a move must keep from any wall/obstacle edge (agent size is 5)
@@ -75,8 +75,8 @@ def action_decision(observation_response: dict, rng: random.Random) -> ActionReq
         move_x, move_y = _toward(target, speed)
         turn_angle = np.arctan2(move_y, move_x)
     else:
-        move_x, move_y = _wander(agent_id, speed)
-        turn_angle = np.arctan2(move_y, move_x)
+        move_x, move_y = speed, 0.0  # keep walking in whatever direction we're already facing
+        turn_angle = _wander_turn(agent_id)
 
     if not evading:
         # Fleeing takes priority over politely stepping aside.
@@ -124,19 +124,22 @@ def _toward(target, speed):
     return move_x, move_y
 
 
-def _wander(agent_id, speed):
+def _wander_turn(agent_id):
     """
-    A slowly, smoothly turning heading, unique per agent and independent of
-    rng (see module docstring). base_offset spreads different agents across
-    different starting directions (golden-angle spacing, so they don't all
-    start out wandering the same way); phase then advances every tick and
-    swings the heading back and forth by WANDER_AMPLITUDE around that base.
+    A small, slowly-oscillating turn, unique per agent and independent of
+    rng (see module docstring). turn_angle applies relative to the agent's
+    CURRENT facing, so this has to stay small: turning by anywhere close to
+    a full target heading every tick flips "forward" before any real
+    distance accumulates, which is what caused agents to visibly spin in
+    place instead of travel (an earlier version of this function made
+    exactly that mistake). Each agent starts at a different phase
+    (golden-angle spacing by agent_id) so they don't all curve the same way
+    at the same time.
     """
-    base_offset = (agent_id * 2.399963) % (2 * np.pi)
-    phase = _wander_phase.get(agent_id, 0.0) + WANDER_STEP
+    start_phase = (agent_id * 2.399963) % (2 * np.pi)
+    phase = _wander_phase.get(agent_id, start_phase) + WANDER_STEP
     _wander_phase[agent_id] = phase
-    heading = base_offset + WANDER_AMPLITUDE * np.sin(phase)
-    return speed * np.cos(heading), speed * np.sin(heading)
+    return WANDER_TURN_STEP * np.sin(phase)
 
 
 def _apply_divergence(move_x, move_y, nearby_agents):

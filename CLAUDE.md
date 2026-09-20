@@ -271,3 +271,18 @@ tick one.
   policy's ~144 average, and ~33x the original 21.16 baseline. Not yet
   watched live to confirm the intended behavior (scattering, facing down
   predators, no freezing) matches what is actually happening on screen.
+- Watched v1 live (seed 2937598241): scored 370.80, population grew as high
+  as 21 agents. Spotted a real bug: many agents spinning in place instead
+  of moving. Cause: `_wander` computed a full target heading and set
+  `turn_angle` to it every tick, but `turn_angle` applies relative to the
+  agent's CURRENT facing, not absolute. For most agent_ids that target
+  heading is large (near a half turn), so the agent flipped its facing by
+  roughly that amount every single tick instead of settling into a
+  direction, looking like it was spinning (because it was).
+- Strategy B v2: rewrote wander (`_wander_turn`) to turn by a small amount
+  each tick (`WANDER_TURN_STEP`, capped well under a full turn) and
+  otherwise just walk forward, instead of re-aiming at a big angle every
+  tick. Verified with the ground-truth tracer on a 649s / 20+ agent run:
+  no sustained stuck streaks anywhere. Scores on 6 fresh runs after the
+  fix: 696.2, 645.3, 616.1, 835.6, 729.3, 531.0 (average ~675) — no
+  regression from v1's ~707, and the spinning is gone.
